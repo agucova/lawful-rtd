@@ -49,7 +49,7 @@ def gather_blocks_with_h1(root, test_mode: bool = False) -> List[Tuple[str, str]
     blocks: List[Tuple[str, str]] = []
     current_h1 = "Unknown"
     total_words = 0
-    WORD_LIMIT = 20000  # Test mode word limit
+    WORD_LIMIT = 150000  # Test mode word limit
 
     for section in root.findall(".//section"):
         for element in section:
@@ -102,11 +102,16 @@ def gather_blocks_recursive(root) -> List[Tuple[str, List[str]]]:
 
     print(f"DEBUG: Collected {len(valid_sections)} valid sections with content")
 
+    # If we only have one section, don't create a chunk
+    if len(valid_sections) <= 1:
+        print("DEBUG: Only one section found - no need for recursive processing")
+        return []
+
     # Group sections for processing
     chunks: List[Tuple[str, List[str]]] = []
     for i in range(0, len(valid_sections), RECURSIVE_LEVEL_MAX_SECTIONS):
         group = valid_sections[i:i + RECURSIVE_LEVEL_MAX_SECTIONS]
-        if group:  # Only add non-empty groups
+        if len(group) > 1:  # Only create chunks if we have multiple sections to combine
             context = f"Sections {i+1} to {i+len(group)} of {len(valid_sections)}"
             chunks.append((context, group))
             print(f"DEBUG: Created chunk {len(chunks)} with {len(group)} sections")
@@ -340,48 +345,18 @@ def retrieve_batch_results(batch_id: str) -> Dict[str, str]:
     return out
 
 def build_xml_from_summaries(summaries: List[str]) -> str:
-    """
-    Build XML preserving analysis and summary structure with proper indentation.
-    """
-    print(f"DEBUG: Building XML from {len(summaries)} summaries")
-
-    # Create root element
     root = etree.Element("book")
 
     for i, summ in enumerate(summaries, start=1):
         if not summ.strip():
-            print(f"DEBUG: Skipping empty summary {i}")
             continue
 
-        analysis = ""
-        summary = ""
+        section = etree.SubElement(root, "section")
+        section.set("iteration", str(i))
 
-        if "<chunk_analysis>" in summ and "</chunk_analysis>" in summ:
-            parts = summ.split("</chunk_analysis>")
-            analysis = parts[0].replace("<chunk_analysis>", "").strip()
-            if len(parts) > 1:
-                summary = parts[1].strip()
-        else:
-            summary = summ
+        summary = etree.SubElement(section, "summary")
+        summary.text = summ.strip()
 
-        # Only add sections with actual content
-        if analysis.strip() or summary.strip():
-            section = etree.SubElement(root, "section")
-            section.set("iteration", str(i))
-
-            analysis_elem = etree.SubElement(section, "analysis")
-            analysis_elem.text = analysis
-
-            summary_elem = etree.SubElement(section, "summary")
-            summary_elem.text = summary
-
-            print(f"DEBUG: Added section {i} with {len(analysis)} chars of analysis and {len(summary)} chars of summary")
-
-    if len(root) == 0:
-        print("WARNING: No valid sections generated!")
-        return "<book>\n  <section iteration=\"1\">\n    <summary>No valid content found</summary>\n  </section>\n</book>"
-
-    # Convert to string with proper indentation
     return etree.tostring(root, encoding="unicode", pretty_print=True)
 
 def summarize_iteration(
@@ -563,7 +538,7 @@ def summarize(
 
     rprint(f"Loaded {total_chars:,} chars => ~{approx_tokens:,} tokens")
     if test_mode:
-        rprint("[yellow]Running in TEST MODE - only processing first 20k words[/yellow]")
+        rprint("[yellow]Running in TEST MODE - only processing first 150k words[/yellow]")
     if dry_run:
         rprint("[yellow]Running in DRY RUN mode - no API calls will be made[/yellow]")
 
