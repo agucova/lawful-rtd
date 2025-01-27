@@ -8,6 +8,8 @@ dependencies = [
     "anthropic>=0.45.0",
     "beautifulsoup4>=4.12.3",
     "ebooklib>=0.18",
+    "lxml>=5.3.0",
+    "lxml-stubs>=0.5.1",
 ]
 
 [tool.pyright]

@@ -1,89 +1,128 @@
-#!/usr/bin/env python3
-
-"""
-summarize_book_batched.py
-
-Usage:
-  python summarize_book_batched.py
-
-Description:
-  Reads the .txt file from output/project_lawful_full.txt, then
-  performs multi-iteration chunk-based summarization using Anthropic's
-  Batches API. Writes final summary to output/final_summary.txt, and
-  iteration checkpoints to output/checkpoints/.
-"""
-
 import os
-import json
+import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Dict
 
 import anthropic
+from lxml import etree
+
+# Adjust imports to match your installed Anthropic Python SDK version:
 from anthropic.types.messages.batch_create_params import Request
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
-
 
 # =====================
 # CONFIGURABLE PARAMS
 # =====================
 
 MAX_CHARS_PER_CHUNK = 15000
-CHECKPOINT_DIR = Path("output/checkpoints_batched")  # for iteration_{N}.json
-
-# Batches-supported model names include:
-#   - claude-3-5-haiku-20241022
-#   - claude-3-5-sonnet-20241022
-#   - claude-3-haiku-20240307
-#   - claude-3-opus-20240229
-BATCH_MODEL = "claude-3-5-haiku-20241022"
-
-# Rough conversion from chars -> tokens
+CHECKPOINT_DIR = Path("output/checkpoints_xml_h1")
+BATCH_MODEL = "claude-3-5-haiku-20241022"  # or any Batches-supported model
 CHARS_PER_TOKEN = 4.0
 
+# Prompt template: includes heading context
+PROMPT_TEMPLATE = """You are a helpful assistant that summarizes text from a larger document.
 
-def chunk_text(text: str, max_chunk_size: int = MAX_CHARS_PER_CHUNK) -> List[str]:
+Context Heading: {heading}
+
+Please summarize the following text in a concise manner:
+
+---
+{chunk}
+---
+"""
+
+
+def parse_xml(text: str):
     """
-    Splits the text into chunks of up to max_chunk_size characters.
+    Parse the given text as XML, returning the root element or None if there's an error.
     """
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + max_chunk_size, len(text))
-        chunks.append(text[start:end])
-        start = end
+    parser = etree.XMLParser(remove_comments=True, recover=True)
+    try:
+        root = etree.fromstring(text, parser=parser)
+        return root
+    except Exception as e:
+        print(f"Warning: parse_xml error: {e}")
+        return None
+
+
+def gather_blocks_with_h1(root) -> List[Tuple[str, str]]:
+    """
+    Traverse <book> and <section>, tracking the most recent <h1> as the "context heading."
+    Return a list of (heading_context, block_html).
+    """
+    blocks: List[Tuple[str, str]] = []
+    current_h1 = "Unknown"
+
+    for section in root.findall(".//section"):
+        for element in section:
+            tag = element.tag.lower()
+            if tag == "h1":
+                # Extract text from <h1>
+                current_h1 = element.xpath("string()").strip()
+            elif tag in {"p", "h2", "h3", "h4", "h5", "h6", "div"}:
+                block_str = etree.tostring(element, encoding="unicode", pretty_print=False).strip()
+                blocks.append((current_h1, block_str))
+            else:
+                # skip or handle other tags as you wish
+                pass
+
+    return blocks
+
+
+def chunk_blocks_grouped_by_h1(
+    blocks: List[Tuple[str, str]],
+    max_chars: int = MAX_CHARS_PER_CHUNK
+) -> List[Tuple[str, List[str]]]:
+    """
+    Produce a list of chunks, each chunk = (heading_context, [list_of_block_html]).
+    We never mix blocks with different <h1> contexts in the same chunk,
+    and we also enforce the max_chars limit. (Heading is always a string.)
+    """
+    chunks: List[Tuple[str, List[str]]] = []
+
+    # Start with an empty string—never None—so we avoid type-check errors
+    current_context: str = ""
+    current_blocks: List[str] = []
+    current_len = 0
+
+    for (ctx, block_html) in blocks:
+        block_len = len(block_html)
+        if ctx != current_context or (current_len + block_len > max_chars):
+            if current_blocks:
+                chunks.append((current_context, current_blocks))
+            current_context = ctx
+            current_blocks = [block_html]
+            current_len = block_len
+        else:
+            current_blocks.append(block_html)
+            current_len += block_len
+
+    # final chunk
+    if current_blocks:
+        chunks.append((current_context, current_blocks))
+
     return chunks
 
 
-def create_batch_of_chunk_requests(
-    chunks: List[str], iteration: int, max_tokens_per_summary: int = 800
-) -> str:
+def create_batch_with_context(chunks: List[Tuple[str, List[str]]], iteration: int) -> str:
     """
-    Creates a batch with one request per chunk.
-    Returns the batch_id string.
+    Build a single batch of requests for the given iteration.
+    Each chunk has (heading_context, [block_htmls]).
+    We'll pass a prompt to Claude with that heading and the chunk's HTML.
     """
     client = anthropic.Anthropic()
+    requests: List[Request] = []
 
-    requests = []
-    for i, chunk in enumerate(chunks):
-        custom_id = f"it{iteration}-chunk{i+1}"
+    for i, (heading, blocks) in enumerate(chunks, start=1):
+        combined_html = "\n".join(blocks)
+        prompt = PROMPT_TEMPLATE.format(heading=heading, chunk=combined_html)
 
-        # You can add a "system" role for extra context, or keep it simple:
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    "You are a helpful assistant that summarizes text.\n\n"
-                    "Please summarize the following text in a concise manner:\n\n"
-                    f"---\n{chunk}\n---\n"
-                )
-            }
-        ]
-
+        custom_id = f"it{iteration}-chunk{i}"
         params = MessageCreateParamsNonStreaming(
             model=BATCH_MODEL,
-            max_tokens=max_tokens_per_summary,
-            messages=messages
+            max_tokens=1000,  # adjust as needed
+            messages=[{"role": "user", "content": prompt}]
         )
         requests.append(Request(custom_id=custom_id, params=params))
 
@@ -94,7 +133,7 @@ def create_batch_of_chunk_requests(
 
 def wait_for_batch_completion(batch_id: str, poll_interval_sec: float = 5.0) -> None:
     """
-    Poll the Batches API until the batch finishes (or expires/cancels).
+    Poll the Batches API until the batch finishes or fails.
     """
     client = anthropic.Anthropic()
 
@@ -102,149 +141,190 @@ def wait_for_batch_completion(batch_id: str, poll_interval_sec: float = 5.0) -> 
         batch = client.messages.batches.retrieve(batch_id)
         status = batch.processing_status
         counts = batch.request_counts
-
         print(
             f"  Polling batch {batch_id} => status={status}, "
             f"processing={counts.processing}, succeeded={counts.succeeded}, "
             f"errored={counts.errored}, canceled={counts.canceled}, expired={counts.expired}."
         )
-
         if status == "ended":
             return
         elif status == "in_progress":
             time.sleep(poll_interval_sec)
-        elif status in ("canceled", "expired"):
-            raise RuntimeError(f"Batch {batch_id} ended with status {status}")
         else:
-            time.sleep(poll_interval_sec)
+            raise RuntimeError(f"Batch ended with unexpected status: {status}")
 
 
-def retrieve_batch_results(batch_id: str) -> dict[str, str]:
+def retrieve_batch_results(batch_id: str) -> Dict[str, str]:
     """
-    Retrieve results from a finished batch. Returns a dict: { custom_id -> summary }.
+    Retrieve the results from the batch. Return { custom_id => summary_text }.
+
+    Each item in results() has item.result, whose .type can be:
+      - "succeeded"
+      - "errored"
+      - "canceled"
+      - "expired"
+
+    We only read item.result.message and item.result.message.content
+    if item.result.type == "succeeded".
     """
     client = anthropic.Anthropic()
-    result_map = {}
+    out: Dict[str, str] = {}
 
-    for result in client.messages.batches.results(batch_id):
-        cid = result.custom_id
-        rtype = result.result.type
-        if rtype == "succeeded" and result.result.message:
-            # Combine text content segments
-            segments = []
-            for seg in result.result.message.content:
-                if seg["type"] == "text":
-                    segments.append(seg["text"])
-            summary_text = "".join(segments).strip()
-            result_map[cid] = summary_text
+    for item in client.messages.batches.results(batch_id):
+        if item.result.type == "succeeded":
+            # item.result should have .message, .message.content
+            success_result = item.result
+            if success_result.message and success_result.message.content:
+                segments: List[str] = []
+                for seg in success_result.message.content:
+                    if seg.type == "text":
+                        segments.append(seg.text)
+                summary_text = "".join(segments).strip()
+                out[item.custom_id] = summary_text
+            else:
+                out[item.custom_id] = ""
         else:
-            print(f"  Request {cid} => {rtype}, storing empty summary.")
-            result_map[cid] = ""
+            # For errored/canceled/expired, store empty
+            out[item.custom_id] = ""
 
-    return result_map
+    return out
 
 
-def summarize_iteration(iteration: int, input_text: str) -> List[str]:
+def build_xml_from_summaries(summaries: List[str]) -> str:
     """
-    - Chunk the text
-    - Create & process a batch
-    - Retrieve partial summaries
-    - Write iteration checkpoint
-    - Return partial summaries
+    Build minimal well-formed XML from partial summaries, e.g.:
+      <book>
+        <section iteration="1">
+          <summary> ... </summary>
+        </section>
+        <section iteration="2">
+          <summary> ... </summary>
+        </section>
+      </book>
     """
-    chunks = chunk_text(input_text, MAX_CHARS_PER_CHUNK)
-    print(f"[Iteration {iteration}] Summarizing {len(chunks)} chunks...")
+    sections = []
+    for i, summ in enumerate(summaries, start=1):
+        escaped_summ = summ  # For robust safety, you could XML-escape here
+        section_xml = f'<section iteration="{i}">\n  <summary>{escaped_summ}</summary>\n</section>'
+        sections.append(section_xml)
 
-    batch_id = create_batch_of_chunk_requests(chunks, iteration)
+    combined = "<book>\n" + "\n\n".join(sections) + "\n</book>"
+    return combined
+
+
+def summarize_iteration(iteration: int, xml_text: str) -> str:
+    """
+    Single summarization iteration:
+      1) Parse xml_text
+      2) gather (heading, block_html)
+      3) chunk by heading & size
+      4) create + process a batch
+      5) build minimal XML from partial summaries
+      6) return that new XML
+    """
+    root = parse_xml(xml_text)
+    if not root:
+        # fallback: parse error => treat all as one chunk
+        return f"<book><section iteration=\"{iteration}\"><summary>(Parse error) {xml_text}</summary></section></book>"
+
+    blocks = gather_blocks_with_h1(root)
+    chunked = chunk_blocks_grouped_by_h1(blocks, MAX_CHARS_PER_CHUNK)
+    batch_id = create_batch_with_context(chunked, iteration)
     wait_for_batch_completion(batch_id)
     results = retrieve_batch_results(batch_id)
 
-    partial_summaries = []
-    for i in range(len(chunks)):
+    # Reassemble partial summaries in correct order
+    partial_summaries: List[str] = []
+    for i in range(len(chunked)):
         cid = f"it{iteration}-chunk{i+1}"
         partial_summaries.append(results.get(cid, ""))
 
-    # Checkpoint
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    checkpoint_file = CHECKPOINT_DIR / f"iteration_{iteration}.json"
-    checkpoint_file.write_text(json.dumps(partial_summaries, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    print(f"  => Wrote iteration {iteration} checkpoint -> {checkpoint_file}")
-    return partial_summaries
-
-
-def reconstruct_text_from_summaries(partial_summaries: List[str]) -> str:
-    """
-    Combine partial summaries into a single text for the next iteration.
-    """
-    return "\n".join(partial_summaries)
+    iteration_xml = build_xml_from_summaries(partial_summaries)
+    return iteration_xml
 
 
 def iterative_summarize_text(full_text: str) -> str:
     """
-    Repeatedly chunk + batch-summarize until text fits in 1 chunk.
-    Uses iteration-based checkpoints in output/checkpoints_batched/.
+    Main iterative loop:
+    - If the text is small enough for 1 chunk => final pass
+    - Otherwise do partial summarization
+    - Store checkpoint each iteration
+    - Stop when final
     """
-    existing_ckpts = sorted(CHECKPOINT_DIR.glob("iteration_*.json"))
-    if existing_ckpts:
-        # Resume from last checkpoint
-        last_ckpt = existing_ckpts[-1]
-        iteration_str = last_ckpt.stem.split("_")[-1]
-        iteration = int(iteration_str) + 1
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    existing_ckpts = sorted(CHECKPOINT_DIR.glob("iteration_*.xml"))
 
-        partial_summaries = json.loads(last_ckpt.read_text(encoding="utf-8"))
-        current_text = reconstruct_text_from_summaries(partial_summaries)
-        print(f"Resuming from iteration {iteration-1}, text length={len(current_text)} chars.")
+    if existing_ckpts:
+        last_ckpt = existing_ckpts[-1]
+        iteration_num = int(last_ckpt.stem.split("_")[-1]) + 1
+        current_text = last_ckpt.read_text(encoding="utf-8")
+        print(f"Resuming from iteration {iteration_num-1}, loaded {last_ckpt}")
     else:
-        iteration = 1
+        iteration_num = 1
         current_text = full_text
 
     while True:
-        if len(current_text) <= MAX_CHARS_PER_CHUNK:
-            # Final pass
-            print(f"[Iteration {iteration}] Final pass => single chunk of {len(current_text)} chars.")
-            partial_sums = summarize_iteration(iteration, current_text)
-            return partial_sums[0] if partial_sums else ""
+        root = parse_xml(current_text)
+        if not root:
+            print("Parse error => single pass summarization")
+            final_xml = summarize_iteration(iteration_num, current_text)
+            path_ckpt = CHECKPOINT_DIR / f"iteration_{iteration_num}.xml"
+            path_ckpt.write_text(final_xml, encoding="utf-8")
+            return final_xml
 
-        # Normal pass
-        partial_sums = summarize_iteration(iteration, current_text)
-        iteration += 1
-        current_text = reconstruct_text_from_summaries(partial_sums)
+        blocks = gather_blocks_with_h1(root)
+        total_len = sum(len(b[1]) for b in blocks)
+        if total_len <= MAX_CHARS_PER_CHUNK:
+            # final pass
+            print(f"[Iteration {iteration_num}] Single-chunk pass with {len(blocks)} blocks (~{total_len} chars).")
+            final_xml = summarize_iteration(iteration_num, current_text)
+            path_ckpt = CHECKPOINT_DIR / f"iteration_{iteration_num}.xml"
+            path_ckpt.write_text(final_xml, encoding="utf-8")
+            return final_xml
+        else:
+            # partial pass
+            print(f"[Iteration {iteration_num}] Summarizing {len(blocks)} blocks (~{total_len} chars)...")
+            out_xml = summarize_iteration(iteration_num, current_text)
+            ckpt_path = CHECKPOINT_DIR / f"iteration_{iteration_num}.xml"
+            ckpt_path.write_text(out_xml, encoding="utf-8")
+            iteration_num += 1
+            current_text = out_xml
 
 
 def estimate_tokens(chars: int) -> int:
-    """
-    Rough estimate of tokens from chars.
-    """
     return int(chars / CHARS_PER_TOKEN)
 
 
 def main():
-    # Must set your Anthropic key in the environment
+    if len(sys.argv) != 2:
+        print("Usage: python summarize_book_batched_xml_h1.py path/to/book.xml")
+        sys.exit(1)
+
+    xml_file = Path(sys.argv[1])
+    if not xml_file.is_file():
+        raise FileNotFoundError(f"XML file not found: {xml_file}")
+
+    # Make sure Anthropic API key is set
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("Please set ANTHROPIC_API_KEY in environment.")
 
-    # We'll load from output/project_lawful_full.txt
-    output_dir = Path("output")
-    text_file = output_dir / "project_lawful_full.txt"
-    final_summary_file = output_dir / "final_summary.txt"
+    # Just ensuring the key is in environment for the client
+    os.environ["ANTHROPIC_API_KEY"] = api_key
 
-    if not text_file.is_file():
-        raise FileNotFoundError(f"Text file not found: {text_file}")
-
-    full_text = text_file.read_text(encoding="utf-8")
-
+    full_text = xml_file.read_text(encoding="utf-8")
     total_chars = len(full_text)
     approx = estimate_tokens(total_chars)
-    print(f"Loaded {total_chars} chars => ~{approx} tokens from {text_file}.")
+    print(f"Loaded {total_chars} chars => ~{approx} tokens from {xml_file}.\n")
 
     final_summary = iterative_summarize_text(full_text)
 
-    # Save final summary
-    final_summary_file.write_text(final_summary, encoding="utf-8")
-    print(f"\n=============== Final Summary ===============\n\n{final_summary}\n")
-    print(f"Saved final summary => {final_summary_file}")
+    # Write final
+    final_path = Path("output/final_summary_with_h1.xml")
+    final_path.write_text(final_summary, encoding="utf-8")
+    print(f"\n================ FINAL SUMMARY (XML) ================\n{final_summary[:1000]}...\n")
+    print(f"Wrote final summary => {final_path}")
+
 
 if __name__ == "__main__":
     main()
