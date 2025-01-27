@@ -4,4 +4,15 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "anthropic>=0.45.0",
+    "beautifulsoup4>=4.12.3",
+    "ebooklib>=0.18",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.uv.sources]
+ebooklib = { git = "https://github.com/aerkalov/ebooklib" }
